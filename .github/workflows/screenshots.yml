@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 concurrency:
   group: screenshots-${{ github.event.pull_request.number }}
@@ -40,7 +41,6 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          # 1) Try AFFECTED_ROUTES block from PR body
           PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q .body)
           ROUTES=$(printf '%s' "$PR_BODY" \
             | awk '/<!-- AFFECTED_ROUTES -->/,/<!-- \/AFFECTED_ROUTES -->/' \
@@ -49,7 +49,6 @@ jobs:
             | grep -v '^none$' \
             | paste -sd ',' - || true)
 
-          # 2) Fallback: derive from changed page files
           if [ -z "$ROUTES" ]; then
             git fetch origin "$BASE_REF" --depth=50 2>/dev/null || true
             ROUTES=$(git diff --name-only "origin/$BASE_REF...HEAD" \
@@ -59,7 +58,6 @@ jobs:
               | paste -sd ',' - || true)
           fi
 
-          # 3) Final fallback: home page
           if [ -z "$ROUTES" ]; then
             ROUTES="/"
           fi
@@ -67,12 +65,27 @@ jobs:
           echo "routes=$ROUTES" >> "$GITHUB_OUTPUT"
           echo "Affected routes: $ROUTES"
 
+      - name: Extract linked issue number
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          ISSUE=$(printf '%s' "$PR_BODY" \
+            | grep -ioE '(close[sd]?|fixe?[sd]?|resolve[sd]?)[[:space:]]*:?[[:space:]]*#[0-9]+' \
+            | grep -oE '#[0-9]+' \
+            | head -n1 \
+            | tr -d '#' || true)
+          echo "number=$ISSUE" >> "$GITHUB_OUTPUT"
+          echo "Linked issue: ${ISSUE:-none}"
+
       - name: Build Angular (for stable serving)
         run: npm run build -- --base-href "/" --output-path=dist-screenshots
 
-      - name: Serve build
+      - name: Serve build (SPA mode)
         run: |
-          npx http-server dist-screenshots/browser -p 4200 --silent &
+          npx --yes serve@14 dist-screenshots/browser -l 4200 -s --no-clipboard --no-port-switching &
           npx wait-on http://localhost:4200 -t 60000
 
       - name: Capture screenshots
@@ -84,18 +97,15 @@ jobs:
         id: list
         run: |
           if [ ! -d screenshots ]; then
-            echo "No screenshots directory"
             echo "files=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           shopt -s nullglob
           png_files=(screenshots/*.png)
           if [ ${#png_files[@]} -eq 0 ]; then
-            echo "No PNG files in screenshots/"
             echo "files=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # comma-separated basenames, e.g. "desktop_about.png,mobile_about.png"
           basenames=$(printf '%s\n' "${png_files[@]}" | xargs -n1 basename | paste -sd ',' -)
           echo "files=$basenames" >> "$GITHUB_OUTPUT"
           echo "Captured: $basenames"
@@ -108,15 +118,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Save PNGs OUTSIDE the working tree so git operations don't touch them
           SAVE_DIR=$(mktemp -d)
           cp screenshots/*.png "$SAVE_DIR/"
-          ls -la "$SAVE_DIR"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stash any pending changes from the PR branch (we don't care about them)
           git reset --hard HEAD
           git clean -fdx -e dist-screenshots -e node_modules
 
@@ -128,8 +135,6 @@ jobs:
             git rm -rf . 2>/dev/null || true
             git clean -fdx -e dist-screenshots -e node_modules
             echo "# Screenshots cache" > README.md
-            echo "" >> README.md
-            echo "Auto-generated branch. Do not edit manually." >> README.md
             git add README.md
             git commit -m "Init screenshots cache"
           fi
@@ -137,7 +142,6 @@ jobs:
           rm -rf "pr-$PR_NUMBER"
           mkdir -p "pr-$PR_NUMBER"
           cp "$SAVE_DIR"/*.png "pr-$PR_NUMBER/"
-          ls -la "pr-$PR_NUMBER"
 
           git add "pr-$PR_NUMBER"
           if git diff --cached --quiet; then
@@ -147,11 +151,12 @@ jobs:
             git push origin screenshots-store
           fi
 
-      - name: Comment PR with screenshots
+      - name: Comment PR (and Issue) with screenshots
         if: steps.list.outputs.files != ''
         uses: actions/github-script@v7
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
           FILES: ${{ steps.list.outputs.files }}
           REPO_FULL: ${{ github.repository }}
         with:
@@ -163,54 +168,74 @@ jobs:
             }
 
             const base = `https://raw.githubusercontent.com/${process.env.REPO_FULL}/screenshots-store/pr-${process.env.PR_NUMBER}`;
-
             const desktop = files.filter(f => f.startsWith('desktop_'));
             const mobile = files.filter(f => f.startsWith('mobile_'));
+            const cb = Date.now();
 
-            const cacheBuster = Date.now();
             const renderRoute = (f) => {
               const route = f.replace(/^(desktop|mobile)_/, '').replace(/\.png$/, '').replace(/_/g, '/') || '/';
               const display = route.startsWith('/') ? route : '/' + route;
-              return `\n**${display}**\n\n![${f}](${base}/${f}?v=${cacheBuster})\n`;
+              return `\n**${display}**\n\n![${f}](${base}/${f}?v=${cb})\n`;
             };
 
             const section = (title, list) =>
               list.length === 0 ? '' : `\n### ${title}\n${list.map(renderRoute).join('')}`;
 
-            const body = [
+            const prLink = `https://github.com/${process.env.REPO_FULL}/pull/${process.env.PR_NUMBER}`;
+
+            const prBody = [
               '## 📸 Screenshots',
               '_Updated automatically when this PR changes._',
               section('🖥️ Desktop (1440×900)', desktop),
               section('📱 Mobile (375×812)', mobile),
             ].join('\n');
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: Number(process.env.PR_NUMBER),
-            });
-            const existing = comments.find(c =>
-              c.user && c.user.login === 'github-actions[bot]' &&
-              typeof c.body === 'string' &&
-              c.body.startsWith('## 📸 Screenshots')
-            );
+            const issueBody = [
+              '## 📸 Preview from PR',
+              `_Generated by [PR #${process.env.PR_NUMBER}](${prLink}). Auto-updated._`,
+              section('🖥️ Desktop (1440×900)', desktop),
+              section('📱 Mobile (375×812)', mobile),
+            ].join('\n');
 
-            if (existing) {
-              await github.rest.issues.updateComment({
+            async function upsertComment(issueNumber, body, marker) {
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
+                issue_number: Number(issueNumber),
               });
-              core.info(`Updated comment ${existing.id}`);
-            } else {
-              const { data: created } = await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: Number(process.env.PR_NUMBER),
-                body,
-              });
-              core.info(`Created comment ${created.id}`);
+              const existing = comments.find(c =>
+                c.user && c.user.login === 'github-actions[bot]' &&
+                typeof c.body === 'string' &&
+                c.body.startsWith(marker)
+              );
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+                core.info(`Updated comment ${existing.id} on #${issueNumber}`);
+              } else {
+                const { data: created } = await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: Number(issueNumber),
+                  body,
+                });
+                core.info(`Created comment ${created.id} on #${issueNumber}`);
+              }
+            }
+
+            await upsertComment(process.env.PR_NUMBER, prBody, '## 📸 Screenshots');
+
+            const issueNum = process.env.ISSUE_NUMBER;
+            if (issueNum && issueNum !== '' && issueNum !== process.env.PR_NUMBER) {
+              try {
+                await upsertComment(issueNum, issueBody, '## 📸 Preview from PR');
+              } catch (e) {
+                core.warning(`Could not post to issue #${issueNum}: ${e.message}`);
+              }
             }
 
       - name: Upload artifact (debug fallback)
