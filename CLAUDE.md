@@ -15,14 +15,19 @@ This is an Angular + Tailwind project deployed to GitHub Pages. Follow these rul
 A manager creates an Issue describing the change, then comments `@claude implement this`.
 You implement the change end-to-end: code, routing, build verification, and open a PR.
 
-## Workflow rules
+## Required workflow (do all of these, in this order)
 
-1. Always create a new branch named `claude/issue-<number>-<slug>`.
-2. Never commit directly to `main`.
-3. Run `npm run build` before opening the PR. If it fails, fix it before pushing.
-4. Run `npm run lint` if a script exists. Fix all lint errors.
-5. Keep PRs focused on the single Issue. Do not refactor unrelated code.
-6. If the task is ambiguous, ask a clarifying question in the Issue comment instead of guessing.
+1. Create a new branch named `claude/issue-<number>-<slug>`.
+2. Implement the change.
+3. Run `npm run build` to verify the project compiles. If it fails, fix and retry. **Do not push without a successful build.**
+4. Run `npm run lint` if available. Fix all lint errors before pushing.
+5. Commit and push the branch.
+6. **Open the pull request immediately using `gh pr create`** — do not stop after pushing the branch. The PR must be opened in the same run, not left for the user to create manually.
+   - Use `gh pr create --title "<conventional commit title>" --body "$(cat <<'EOF' ... EOF)" --base main --head <your-branch>`.
+   - Include the `<!-- AFFECTED_ROUTES -->` block in the body (see below).
+   - Include `Closes #<issue_number>` in the body to auto-close the issue on merge.
+
+Never commit directly to `main`. Never refactor unrelated code. If the task is ambiguous, post a clarifying comment on the Issue and stop — do not guess.
 
 ## CRITICAL: PR description format
 
@@ -38,10 +43,23 @@ Every PR you open MUST contain this block in the body, listing every route the c
 Rules:
 - Use leading slash, no trailing slash.
 - Home page is `/`.
-- If you changed a shared component (in `src/app/shared/` or global styles), list ALL existing routes.
-- If the change is non-visual (refactor, build config), put a single line `- none`.
+- If you changed a shared component (in `src/app/shared/`) or global styles (`src/styles.css`), list ALL existing routes in the app.
+- If the change is non-visual (refactor, build config, README), put a single line: `- none`.
 
-The screenshots workflow parses this block and only renders the listed pages. Wrong list = wrong screenshots = blocked review.
+The screenshots workflow parses this block and only renders the listed pages. **A wrong list = wrong screenshots = blocked review.** This block is mandatory — do not omit it. The Issue cannot be considered done if the PR body does not contain this block.
+
+### Example PR body
+
+```
+Adds a new /about route with team biography and a contact form.
+
+Closes #42
+
+<!-- AFFECTED_ROUTES -->
+- /about
+- /contact
+<!-- /AFFECTED_ROUTES -->
+```
 
 ## Routing convention
 
@@ -66,5 +84,14 @@ Always register routes in `src/app/app.routes.ts`.
 ## Build & deploy notes
 
 - The site is deployed to `https://<username>.github.io/test-claude-agent/`.
-- Production build uses `--base-href "/test-claude-agent/"` (handled by the deploy workflow).
+- Production build uses `--base-href "/test-claude-agent/"` (handled by the deploy workflow — do not change).
 - For local dev and CI screenshots, base-href is `/`.
+
+## Available bash commands
+
+You can run these without further approval:
+`npm ci`, `npm run build`, `npm run lint`, `npm test`, `npm run test`,
+`npx ng <subcommand>`, `git <subcommand>`, `gh <subcommand>`,
+`node`, `ls`, `cat`, `mkdir`, `rm`, `cp`, `mv`, `echo`, `pwd`.
+
+Use `gh pr create`, `gh pr view`, `gh issue comment` for GitHub interactions.
