@@ -1,0 +1,165 @@
+name: Screenshots
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: screenshots-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Determine affected routes
+        id: routes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # 1) Try AFFECTED_ROUTES block from PR body
+          PR_BODY=$(gh pr view "$PR_NUMBER" --json body -q .body)
+          ROUTES=$(printf '%s' "$PR_BODY" \
+            | awk '/<!-- AFFECTED_ROUTES -->/,/<!-- \/AFFECTED_ROUTES -->/' \
+            | grep -E '^\s*-\s*' \
+            | sed -E 's/^\s*-\s*//' \
+            | grep -v '^none$' \
+            | paste -sd ',' - || true)
+
+          # 2) Fallback: derive from changed page files
+          if [ -z "$ROUTES" ]; then
+            git fetch origin "$BASE_REF" --depth=50 2>/dev/null || true
+            ROUTES=$(git diff --name-only "origin/$BASE_REF...HEAD" \
+              | grep -oE 'src/app/pages/[^/]+' \
+              | awk -F/ '{print "/"$NF}' \
+              | sort -u \
+              | paste -sd ',' - || true)
+          fi
+
+          # 3) Final fallback: home page
+          if [ -z "$ROUTES" ]; then
+            ROUTES="/"
+          fi
+
+          echo "routes=$ROUTES" >> "$GITHUB_OUTPUT"
+          echo "Affected routes: $ROUTES"
+
+      - name: Build Angular (for stable serving)
+        run: npm run build -- --base-href "/" --output-path=dist-screenshots
+
+      - name: Serve build
+        run: |
+          npx http-server dist-screenshots/browser -p 4200 --silent &
+          npx wait-on http://localhost:4200 -t 60000
+
+      - name: Capture screenshots
+        env:
+          AFFECTED_ROUTES: ${{ steps.routes.outputs.routes }}
+        run: npx playwright test
+
+      - name: Push screenshots to cache branch
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if ! ls screenshots/*.png 2>/dev/null; then
+            echo "No screenshots produced; skipping push."
+            exit 0
+          fi
+
+          mkdir -p /tmp/keep
+          cp screenshots/*.png /tmp/keep/
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin screenshots-store >/dev/null 2>&1; then
+            git fetch origin screenshots-store
+            git checkout screenshots-store
+          else
+            git checkout --orphan screenshots-store
+            git rm -rf . 2>/dev/null || true
+            git clean -fdx
+            echo "Screenshots cache for PRs" > README.md
+            git add README.md
+          fi
+
+          rm -rf "pr-$PR_NUMBER"
+          mkdir -p "pr-$PR_NUMBER"
+          cp /tmp/keep/*.png "pr-$PR_NUMBER/"
+
+          git add "pr-$PR_NUMBER"
+          git commit -m "Screenshots for PR #$PR_NUMBER" || echo "No changes"
+          git push origin screenshots-store
+
+      - name: Comment PR with screenshots
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('screenshots')) return;
+            const files = fs.readdirSync('screenshots').filter(f => f.endsWith('.png')).sort();
+            if (files.length === 0) return;
+
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            const base = `https://raw.githubusercontent.com/${repo}/screenshots-store/pr-${process.env.PR_NUMBER}`;
+
+            const desktop = files.filter(f => f.startsWith('desktop_'));
+            const mobile = files.filter(f => f.startsWith('mobile_'));
+
+            const section = (title, list) => list.length === 0 ? '' :
+              `\n### ${title}\n` + list.map(f => {
+                const route = f.replace(/^(desktop|mobile)_/, '').replace('.png', '').replace(/_/g, '/') || '/';
+                return `\n**${route}**\n\n![${f}](${base}/${f})\n`;
+              }).join('');
+
+            const body = `## 📸 Screenshots\n_Updated automatically when this PR changes._\n${section('🖥️ Desktop (1440×900)', desktop)}${section('📱 Mobile (375×812)', mobile)}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+            });
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' && c.body && c.body.startsWith('## 📸 Screenshots')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(process.env.PR_NUMBER),
+                body,
+              });
+            }
