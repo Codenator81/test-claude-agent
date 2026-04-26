@@ -1,12 +1,10 @@
 import { Component } from '@angular/core';
-import { NavComponent } from '../../shared/nav/nav.component';
 
 @Component({
   selector: 'app-about',
   standalone: true,
-  imports: [NavComponent],
+  imports: [],
   template: `
-    <app-nav />
     <main class="min-h-screen flex items-center justify-center px-4 py-12">
       <article class="max-w-xl w-full">
         <h1 class="text-4xl md:text-5xl font-bold text-gray-900 mb-6">
